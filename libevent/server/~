@@ -71,22 +71,6 @@ class net_object
 		bufferevent* get_bufferevent(){return m_bev;}
 		evbuffer* get_sendbuffer(){return m_sendbuffer;}
 
-		void send(string msgdata)
-		{
-			if(msgdata != "")
-			{
-				evbuffer_add(m_sendbuffer, msgdata.c_str(), msgdata.size());
-			}
-			int len = evbuffer_get_length(m_sendbuffer);
-			if(len > 0)
-			{
-				int ret = bufferevent_write_buffer(m_bev, m_sendbuffer);
-				if(ret)
-				{
-					bufferevent_enable(m_bev, EV_WRITE);
-				}
-			}
-		}
 	private:
 		int m_charid;
 		string m_buf;
@@ -251,7 +235,7 @@ class libevent_server_module: public server_module
 				cout << "client " << object->get_fd() << " send " << buf << endl;
 				
 				string sendbuf(buf); 
-				object->send(sendbuf);
+				object->get_module()->sendmsg(object->get_fd(), sendbuf);
 				delete buf;
 			}
 		}
@@ -263,7 +247,15 @@ class libevent_server_module: public server_module
 				cerr << "connect object null" << endl;
 				return;
 			}
-			object->send("");
+			int len = evbuffer_get_length(object->get_sendbuffer());
+			if(len > 0)
+			{
+				int ret = bufferevent_write_buffer(object->get_bufferevent(), object->get_sendbuffer());
+				if(ret)
+				{
+					bufferevent_enable(object->get_bufferevent(), EV_WRITE);
+				}
+			}
 		}
 		static void cb_event(struct bufferevent *bev, short events, void *user_data)
 		{
@@ -276,14 +268,24 @@ class libevent_server_module: public server_module
 
 			if(events & BEV_EVENT_EOF || events & BEV_EVENT_ERROR || events & BEV_EVENT_TIMEOUT)
 			{
-				cout << "client disconnected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
+				cout << "Client Disconnected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
 				object->get_module()->del_net_object(object->get_fd());		
 			}
 			else if(events & BEV_EVENT_CONNECTED)
 			{
-				cout << "client connected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
-				object->send("key client");
+				cout << "Client Connected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
+				object->get_module()->sendmsg(object->get_fd(), "hey client");
 			}
+		}
+		void sendmsg(intptr_t fd, string msg)
+		{
+			net_object *object = get_net_object(fd);
+			if(!object)
+			{
+				return;
+			}
+			evbuffer_add(object->get_sendbuffer(), msg.c_str(), msg.length());
+			bufferevent_enable(object->get_bufferevent(), EV_WRITE);
 		}
 };
 //--------------------------------------------
@@ -311,22 +313,6 @@ class connect_object
 			m_bev = bev;
 			m_fd = fd;
 			m_module = module;
-		}
-		void send(string msgdata)
-		{
-			if(msgdata != "")
-			{
-				evbuffer_add(m_sendbuffer, msgdata.c_str(), msgdata.size());
-			}
-			int len = evbuffer_get_length(m_sendbuffer);
-			if(len > 0)
-			{
-				int ret = bufferevent_write_buffer(m_bev, m_sendbuffer);
-				if(ret)
-				{
-					bufferevent_enable(m_bev, EV_WRITE);
-				}
-			}
 		}
 		bufferevent* get_bufferevent(){return m_bev;}
 		intptr_t get_fd(){return m_fd;}
@@ -405,13 +391,23 @@ class libevent_client_module: public client_module
 		}
 		static void cb_write(struct bufferevent *bev, void *user_data)
 		{
+				cout << "write2 connect " << endl;
 			connect_object *object = (connect_object *)user_data;
 			if(!object)
 			{
 				cerr << "connect object null" << endl;
 				return;
 			}
-			object->send("");
+			int len = evbuffer_get_length(object->get_sendbuffer());
+			if(len > 0)
+			{
+				cout << "write connect " << endl;
+				int ret = bufferevent_write_buffer(object->get_bufferevent(), object->get_sendbuffer());
+				if(ret)
+				{
+					bufferevent_enable(object->get_bufferevent(), EV_WRITE);
+				}
+			}
 		}
 
 		static void cb_event(struct bufferevent *bev, short events, void *user_data)
@@ -428,12 +424,19 @@ class libevent_client_module: public client_module
 			}
 			else if(events & BEV_EVENT_CONNECTED)
 			{
-				object->send("helloaaa");
+				object->get_module()->sendcode("helloaaa");
 			}
 		}
 		static void cb_timeout(evutil_socket_t fd, short, void *ctx)
 		{
-			cout << "timeout " << endl;
+				
+				cout << "timeout " << endl;
+		}
+		void sendcode(string msgdata)
+		{
+				cout << "buffer connct " << endl;
+			evbuffer_add(connect.get_sendbuffer(), msgdata.c_str(), msgdata.size());
+			bufferevent_enable(connect.get_bufferevent(), EV_WRITE);
 		}
 	public:
 		bool init() override final
@@ -452,7 +455,7 @@ class libevent_client_module: public client_module
 			struct timeval tv;
 			tv.tv_sec = 3;
 			tv.tv_usec = 0;
-			struct event* ev = event_new(base, -1, EV_TIMEOUT|EV_WRITE|EV_PERSIST, cb_timeout, (void *)&connect);
+			struct event* ev = event_new(base, -1, EV_TIMEOUT|EV_PERSIST, cb_timeout, (void *)&connect);
 			event_add(ev, &tv);
 			return client_module::init();
 		}
