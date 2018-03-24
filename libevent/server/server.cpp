@@ -9,8 +9,15 @@
 #include <event2/bufferevent.h>
 #include <arpa/inet.h>
 #include <event2/buffer.h>
+extern "C"  
+{  
+#include "lua.h"  
+#include "lauxlib.h"  
+#include "lualib.h"  
+} 
 using namespace std;
 
+lua_State *L;
 //--------------------------------------------
 // module
 //--------------------------------------------
@@ -73,6 +80,7 @@ class net_object
 
 		void send(string msgdata)
 		{
+			cout << "sendto client " << msgdata.size() << endl;
 			if(msgdata != "")
 			{
 				evbuffer_add(m_sendbuffer, msgdata.c_str(), msgdata.size());
@@ -103,12 +111,12 @@ class server_module: public net_module
 		server_module() {modname = "server_module";}
 };
 //--------------------------------------------
+std::map<evutil_socket_t, net_object *> m_objects;
 class libevent_server_module: public server_module
 {
 	private:
 		struct event_base *base;
 		struct evconnlistener *listener;
-		std::map<evutil_socket_t, net_object *> m_objects;
 	public:
 		libevent_server_module()
 		{
@@ -164,15 +172,6 @@ class libevent_server_module: public server_module
 				object = NULL;
 			}
 		}
-		net_object* get_net_object(intptr_t fd)
-		{
-			auto it = m_objects.find(fd);
-			if(it != m_objects.end())
-			{
-				return it->second;
-			}
-			return NULL;
-		}
 
 		static void cb_accept(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *sa, int socklen, void *user_data)
 		{
@@ -214,11 +213,11 @@ class libevent_server_module: public server_module
 			bufferevent_setcb(bev, cb_read, cb_write, cb_event, (void*)object);
 			bufferevent_enable(bev, EV_READ|EV_WRITE);
 			module->add_net_object(fd, object);
-		
+
 			cb_event(bev, BEV_EVENT_CONNECTED, (void*)object);
 
 			struct timeval tv;
-			tv.tv_sec = 10;
+			tv.tv_sec = 120;
 			tv.tv_usec = 0;
 			bufferevent_set_timeouts(bev, &tv, NULL);
 		}
@@ -231,7 +230,7 @@ class libevent_server_module: public server_module
 				cerr << "object null" << endl;
 				return;
 			}
-			
+
 			struct evbuffer *input = bufferevent_get_input(bev);
 			if(!input)
 			{
@@ -248,8 +247,15 @@ class libevent_server_module: public server_module
 
 				char* buf = new char[len];
 				evbuffer_remove(input, buf, len);
-				cout << "client " << object->get_fd() << " send " << buf << endl;
-				
+				lua_getglobal(L, "onRecv");
+				lua_pushnumber(L, object->get_fd());
+				lua_pushstring(L, buf);
+				int ret = lua_pcall(L, 2, 0, 0);
+				if(ret)
+				{
+					cerr << "panic" <<  ret << endl;
+				}
+
 				string sendbuf(buf); 
 				object->send(sendbuf);
 				delete buf;
@@ -276,13 +282,27 @@ class libevent_server_module: public server_module
 
 			if(events & BEV_EVENT_EOF || events & BEV_EVENT_ERROR || events & BEV_EVENT_TIMEOUT)
 			{
-				cout << "client disconnected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
+				lua_getglobal(L, "onError");
+				lua_pushnumber(L, object->get_fd());
+				lua_pushnumber(L, events);
+				int ret = lua_pcall(L, 2, 0, 0);
+				if(ret)
+				{
+					cerr << "panic" << endl;
+				}
 				object->get_module()->del_net_object(object->get_fd());		
 			}
 			else if(events & BEV_EVENT_CONNECTED)
 			{
-				cout << "client connected " << object->get_fd() << " " << object->get_remoteaddr() << endl;
-				object->send("key client");
+				//lua_pcall(L, 0, 0, 0);
+				lua_getglobal(L, "onConnected");
+				lua_pushnumber(L, object->get_fd());
+				lua_pushstring(L, object->get_remoteaddr());
+				int ret = lua_pcall(L, 2, 0, 0);
+				if(ret)
+				{
+					cerr << "panic" << endl;
+				}
 			}
 		}
 };
@@ -379,7 +399,7 @@ class libevent_client_module: public client_module
 				return false;
 			}
 			connect.init(bev, fd, this);
-	
+
 			struct timeval tv;
 			tv.tv_sec = 10;
 			tv.tv_usec = 0;
@@ -472,10 +492,30 @@ class libevent_client_module: public client_module
 		}
 };
 
-
 //--------------------------------------------
 // server
 //--------------------------------------------
+static int write(lua_State *L)
+{
+	int n = lua_gettop(L);
+	if(n != 2)
+	{
+		lua_pushnumber(L, -1);
+		return 1;
+	}
+	intptr_t fd = lua_tonumber(L, 1);
+	string msg = lua_tostring(L, 2);
+	auto it = m_objects.find(fd);
+	if(it != m_objects.end())
+	{
+		it->second->send(msg);
+		lua_pushnumber(L, 0);
+		return 1;
+	}
+
+	lua_pushnumber(L, -2);
+	return 1;
+}
 class server
 {
 	private:
@@ -483,13 +523,36 @@ class server
 		void _addmodule(module *m) {modules.push_back(m);}
 
 		bool is_running;
-
+		bool _initvm()
+		{
+			L = luaL_newstate();
+			if(L == NULL)
+			{
+				return false;
+			}
+			luaL_openlibs(L);
+			lua_register(L, "cwrite", write);
+			int ret = luaL_dofile(L, "main.lua");
+			if(ret)
+			{
+				cerr << "luaL_dofile" << endl;
+				return false;
+			}
+			return true;
+		}
 	public:
+
 		bool init()
 		{
+			if(!_initvm())
+			{
+				cerr << "initvm error" << endl;
+				return false;
+			}
+
 			_addmodule(new libevent_server_module());
 			_addmodule(new test_module());
-			_addmodule(new libevent_client_module());
+			//_addmodule(new libevent_client_module());
 
 			for(auto it = modules.begin(); it != modules.end(); it ++)
 			{
@@ -544,6 +607,7 @@ class server
 					(*it)->shut();
 				}
 			}
+			lua_close(L);
 		}
 };
 
