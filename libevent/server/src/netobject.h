@@ -36,7 +36,11 @@ class net_object
 			int len = evbuffer_get_length(m_sendbuffer);
 			if(len > 0)
 			{
-				bufferevent_write_buffer(m_bev, m_sendbuffer);
+				int ret = bufferevent_write_buffer(m_bev, m_sendbuffer);
+				if (ret)
+				{
+					bufferevent_enable(m_bev, EV_WRITE);
+				}
 			}
 		}
 	private:
